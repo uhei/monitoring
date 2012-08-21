@@ -17,7 +17,6 @@
 #
 
 use strict;
-use Switch ;
 use List::Util qw[min max];
 use Net::SNMP qw(:snmp);
 use FindBin;
@@ -35,13 +34,14 @@ use constant false => "0" ;
 $PROGNAME = $0;
 my $version = 1;
 my $release = 0;
-sub print_help ();
-sub print_usage ();
-sub verbose ;
-sub get_nexus_table ;
-sub get_nexus_entries ;
-sub get_nexus_component_location ;
-sub evaluate_sensor ;
+my $print_help;
+my $print_usage;
+my $verbose;
+my $get_nexus_table;
+my $get_nexus_entries;
+my $get_nexus_component_location ;
+my $evaluate_sensor ;
+my %nexus_entphysical;
 my $opt_d = 0 ;
 Getopt::Long::Configure('bundling');
 GetOptions
@@ -67,13 +67,45 @@ if ($opt_V) {
     exit $ERRORS{'OK'};
 }
 
+$print_usage = sub {
+    print "Usage:";
+    print "$PROGNAME\n";
+    print "   -H (--hostname)   Hostname to query - (required)\n";
+    print "   -C (--community)  SNMP read community (defaults to public,\n";
+    print "                     used with SNMP v1 and v2c\n";
+    print "   -v (--snmp_version)  1 for SNMP v1 (default)\n";
+    print "                        2 for SNMP v2c\n";
+    print "                        3 for SNMP v3\n";
+    print "   -k (--key)        snmp V3 key\n";
+    print "   -p (--password)   snmp V3 password\n";
+    print "   -u (--username)   snmp v3 username \n";
+    print "   --authprotocol    snmp v3 authprotocol md5|sha \n";
+    print "   --priv            snmp V3 priv password\n";
+    print "   --privprotocol    snmp v3 privprotocol des|aes \n";
+
+    print "   -V (--version)    Plugin version\n";
+    print "   -h (--help)       usage help\n\n" ;
+    print "   -l (--list)       list probes\n";
+    print "   -i (--sysdescr)   use sysdescr instead of sysname for label display\n";
+    print "\n" ;
+    print "   -d (--debug)      debug level (1 -> 15)" ;
+};
+
+$print_help = sub {
+    print "##############################################\n";
+    print "#                ADEO Services               #\n";
+    print "##############################################\n";
+    &$print_usage();
+    print "\n";
+};
+
 if ($opt_h) {
-    print_help();
+    &$print_help();
     exit $ERRORS{'OK'};
 }
 
 $opt_H = shift unless ($opt_H);
-(print_usage() && exit $ERRORS{'OK'}) unless ($opt_H);
+(&$print_usage() && exit $ERRORS{'OK'}) unless ($opt_H);
 
 my $snmp = "1";
 if ($opt_v && $opt_v =~ /^[0-9]$/) {
@@ -134,6 +166,147 @@ my $total_connection = 0;
 my $key ;
 my $value ;
 my @perfparse ;
+
+$verbose = sub {
+    my $message = $_[0];
+    my $messagelevel = $_[1] ;
+
+
+    if ($messagelevel <= $loglevel) {
+        print "$message\n" ;
+	}
+};
+
+$get_nexus_table = sub {
+    my $baseoid = $_[0] ;    
+    my $is_indexed = $_[1] ;
+
+    &$verbose("get table for oid $baseoid", "10") ;
+    if ($snmp == 1) {
+    	$result = $session->get_table(-baseoid => $baseoid) ;
+    }else {
+    	$result = $session->get_table(-baseoid => $baseoid, -maxrepetitions => 20) ;
+    }
+    if (!defined($result)) {
+        print("UNKNOWN: SNMP get_table : ".$session->error()."\n");
+        exit $ERRORS{'UNKNOWN'};
+    }
+    my %nexus_values = %{$result} ;
+    my $id;
+    my $index;
+    my %nexus_return;
+    while(($key,$value) = each(%nexus_values)) {
+        $index = $id = $key ;
+		if ($is_indexed) {
+            $id =~ s/.*\.([0-9]+)\.[0-9]*$/$1/;
+            $key =~ s/(.*)\.[0-9]*\.[0-9]*/$1/ ;
+            $index =~ s/.*\.([0-9]+)$/$1/ ;
+    	    &$verbose("key=$key, id=$id, index=$index, value=$value", "15") ;
+            $nexus_return{$id}{$key}{$index} = $value;
+            $nexus_return{$id}{"id"}{$index} = $id ;
+		}else {
+            $id =~ s/.*\.([0-9]+)$/$1/;
+            $key =~ s/(.*)\.[0-9]*/$1/ ;
+    	    &$verbose("key=$key, id=$id, value=$value", "15") ;
+            $nexus_return{$id}{$key} = $value;
+            $nexus_return{$id}{"id"} = $id ;
+		}
+    }
+    return(%nexus_return) ;
+};
+
+$get_nexus_entries = sub {
+    my (@columns) = @_ ;    
+
+    &$verbose("get entries", "10") ;
+    if ($snmp == 1) {
+    	$result = $session->get_entries(-columns => @columns) ;
+    }else {
+    	$result = $session->get_entries(-columns => @columns, -maxrepetitions => 20) ;
+    }
+    if (!defined($result)) {
+        print("UNKNOWN: SNMP get_entries : ".$session->error()."\n");
+        exit $ERRORS{'UNKNOWN'};
+    }
+    my %nexus_values = %{$result} ;
+    my $id;
+    my %nexus_return;
+    while(($key,$value) = each(%nexus_values)) {
+        $id = $key ;
+        $id =~ s/.*\.([0-9]+)$/$1/;
+        $key =~ s/(.*)\.[0-9]*/$1/ ;
+    	&$verbose("key=$key, id=$id, value=$value", "15") ;
+        $nexus_return{$id}{$key} = $value;
+        $nexus_return{$id}{"id"} = $id ;
+    }
+    return(%nexus_return) ;
+};
+
+$get_nexus_component_location = sub {
+    my $sensor_id = $_[0] ;
+    my $text_output = "" ;
+    $text_output =  $nexus_entphysical{$sensor_id}{&entPhysicalDescr} if (defined($nexus_entphysical{$sensor_id}{&entPhysicalDescr}));
+    my $parent = $nexus_entphysical{$sensor_id}{&entPhysicalContainedIn} ;
+    while (defined($parent) and $parent ne 0) {
+        $text_output .= "->".$nexus_entphysical{$parent}{&entPhysicalDescr} ;
+        $parent = $nexus_entphysical{$parent}{&entPhysicalContainedIn} ;
+    }
+    return($text_output) ;
+};
+
+# defines nexus sensor status
+use constant NEXUS_OK       => 1 ;
+use constant NEXUS_MINOR    => 10 ;
+use constant NEXUS_MAJOR    => 20 ;
+use constant NEXUS_CRITICAL => 30 ;
+
+$evaluate_sensor = sub {
+    my $value     = $_[0];
+    my $compare   = $_[1] ;
+    my $threshold = $_[2] ;
+    my $severity  = $_[3];
+    my $rc = NEXUS_OK ;
+    &$verbose("compare $value to $threshold and will return $severity if operator $compare is met", "15") ;
+		if ($compare == 1) { 
+			&$verbose("lessthan compare", "10") ;
+			if ($value < $threshold) {
+                $rc = $severity ;    
+            }
+		}
+		elsif ($compare == 2) { 
+			&$verbose("lessorequal compare", "10") ;
+			if ($value <= $threshold) {
+                $rc = $severity ;    
+            }
+		}
+		elsif ($compare == 3) { 
+			&$verbose("greaterthan compare", "10") ;
+			if ($value > $threshold) {
+                $rc = $severity ;    
+            }
+		}
+		elsif ($compare == 4) { 
+			&$verbose("greaterorequal compare", "10") ;
+			if ($value > $threshold) {
+                $rc = $severity ;    
+            }
+		}
+		elsif ($compare == 5) { 
+			&$verbose("equalto compare", "10") ;
+			if ($value == $threshold) {
+                $rc = $severity ;    
+            }
+		}
+		elsif ($compare == 6) { 
+			&$verbose("noequalto compare", "10") ;
+			if ($value != $threshold) {
+                $rc = $severity ;    
+            }
+		}
+	&$verbose("comparison result: $rc", "15") ;
+	return($rc) ;
+};
+
 # parse sysDescr
 my $outlabel_oid;
 if ($opt_i) {
@@ -143,13 +316,13 @@ if ($opt_i) {
 	# sysname
 	$outlabel_oid = ".1.3.6.1.2.1.1.5.0" ;
 }
-verbose("get sysdescr ($outlabel_oid)", "5") ;
+&$verbose("get sysdescr ($outlabel_oid)", "5") ;
 my $sysdescr = $session->get_request(-varbindlist => [$outlabel_oid]) ;
 if (!defined($sysdescr)) {
 	print("UNKNOWN: SNMP get_request : ".$session->error()."\n");
 	exit $ERRORS{'UNKNOWN'};
 }
-verbose(" sysdescr is ".$sysdescr->{$outlabel_oid}, "5") ;
+&$verbose(" sysdescr is ".$sysdescr->{$outlabel_oid}, "5") ;
 my $outlabel = $sysdescr->{$outlabel_oid}.": " ;
 
 # define some useful constants
@@ -202,11 +375,6 @@ my @nexus_sensors_threshold_relation = ("unknown", "less than", "less or equal t
 
 my @nagios_return_code = ("OK", "WARNING", "CRITICAL", "UNKNOWN") ;
 
-# defines nexus sensor status
-use constant NEXUS_OK       => 1 ;
-use constant NEXUS_MINOR    => 10 ;
-use constant NEXUS_MAJOR    => 20 ;
-use constant NEXUS_CRITICAL => 30 ;
 my @nexus_return_code ;
 $nexus_return_code[&NEXUS_OK]       = "OK";
 $nexus_return_code[&NEXUS_MINOR]    = "MINOR";
@@ -323,25 +491,25 @@ $nexus_psu_status_to_nagios[&NEXUS_PSU_ONBUTINLINEPOWERFAIL] = $ERRORS{'CRITICAL
 
 ##################### RETRIEVE DATA #######################
 ###### get the sensor table
-verbose("get sensor table", "5") ;
-my %nexus_sensors = get_nexus_table(entSensorValueTable, false) ;
+&$verbose("get sensor table", "5") ;
+my %nexus_sensors = &$get_nexus_table(entSensorValueTable, false) ;
 
 ###### get the sensor threshold table
-verbose("get sensor threshold table", "5") ;
-my %nexus_sensors_thresholds = get_nexus_table(entSensorThresholdTable, true) ;
+&$verbose("get sensor threshold table", "5") ;
+my %nexus_sensors_thresholds = &$get_nexus_table(entSensorThresholdTable, true) ;
 
 ###### get the fru fan table
-verbose("get fru fan table", "5") ;
-my %nexus_frufan = get_nexus_table(cefcFanTrayStatusTable, false) ;
+&$verbose("get fru fan table", "5") ;
+my %nexus_frufan = &$get_nexus_table(cefcFanTrayStatusTable, false) ;
 
 ###### get the fru PSU table
-verbose("get fru psu table", "5") ;
-my %nexus_frupsu = get_nexus_table(cefcFRUPowerStatusTable, false) ;
+&$verbose("get fru psu table", "5") ;
+my %nexus_frupsu = &$get_nexus_table(cefcFRUPowerStatusTable, false) ;
 
 ###### get the physical table
-verbose("get entity physical table", "5") ;
+&$verbose("get entity physical table", "5") ;
 # get only selected columns to speed up data retrieving
-my %nexus_entphysical = get_nexus_entries([&entPhysicalDescr, &entPhysicalContainedIn, &entPhysicalClass]) ;
+%nexus_entphysical = &$get_nexus_entries([&entPhysicalDescr, &entPhysicalContainedIn, &entPhysicalClass]) ;
 
 # When user want to list probes
 if ($opt_l) {
@@ -375,8 +543,8 @@ while( (my $id,$sensor) = each(%nexus_sensors)) {
             my $thresh_severity = $nexus_sensors_thresholds{$sensor_data{"id"}}{&entSensorThresholdSeverity}{$thresh_index} ;
 
 			# proceed with the evaluation (is sensor value {<=|<|=|!=|>|>=} threshold value)
-            verbose("threshold data: thresh_value=$thresh_value tresh_relation=$thresh_relation thresh_severity=$thresh_severity sensor_value=$sensor_value", "15") ;
-			$sensor_alarm = evaluate_sensor($sensor_value, $thresh_relation, $thresh_value, $thresh_severity) ;
+            &$verbose("threshold data: thresh_value=$thresh_value tresh_relation=$thresh_relation thresh_severity=$thresh_severity sensor_value=$sensor_value", "15") ;
+			$sensor_alarm = &$evaluate_sensor($sensor_value, $thresh_relation, $thresh_value, $thresh_severity) ;
             if ($sensor_alarm > $worse_sensor_status) {
 				# too bad, sensor has detected something abnormal
 				# keep the alarm description for the user
@@ -385,12 +553,12 @@ while( (my $id,$sensor) = each(%nexus_sensors)) {
 			# keep only the worst sensor status (critical status not overwritten by minor status) for the current sensor
 			$worse_sensor_status = max($worse_sensor_status, $sensor_alarm) ;
         }
-        verbose("sensor_alarm = $worse_sensor_status (nagios_rc=".$nexus_sensor_to_nagios[$worse_sensor_status].")", "10") ;
+        &$verbose("sensor_alarm = $worse_sensor_status (nagios_rc=".$nexus_sensor_to_nagios[$worse_sensor_status].")", "10") ;
         # put failed items in a separate table
         if ($worse_sensor_status ne NEXUS_OK) {
             $number_of_failed_sensors++ ;
-			verbose("add new sensor status for sensor_id = ".$sensor_data{"id"}." (".get_nexus_component_location($id).") rc=".$nexus_return_code[$sensor_alarm].". type is =".$nexus_sensors_type[$sensor_data{&entSensorType}], 15) ;
-            push(@failed_items_description, $nexus_return_code[$sensor_alarm].": ".$nexus_sensors_type[$sensor_data{&entSensorType}]." (".get_nexus_component_location($sensor_data{"id"}).") is failed: $worse_sensor_description") ;
+			&$verbose("add new sensor status for sensor_id = ".$sensor_data{"id"}." (".&$get_nexus_component_location($id).") rc=".$nexus_return_code[$sensor_alarm].". type is =".$nexus_sensors_type[$sensor_data{&entSensorType}], 15) ;
+            push(@failed_items_description, $nexus_return_code[$sensor_alarm].": ".$nexus_sensors_type[$sensor_data{&entSensorType}]." (".&$get_nexus_component_location($sensor_data{"id"}).") is failed: $worse_sensor_description") ;
         }
  
         # if list option enabled, list sensor data
@@ -402,7 +570,7 @@ while( (my $id,$sensor) = each(%nexus_sensors)) {
 			print " ".$nexus_sensors_type[$sensor_data{&entSensorType}];
 			print " status: ".$nexus_sensors_status[$sensor_data{&entSensorStatus}];
 			print " type: ".$nexus_entphysical_class[$nexus_entphysical{$sensor_data{"id"}}{&entPhysicalClass}] ;
-			print " located in: ".get_nexus_component_location($sensor_data{"id"}) ;
+			print " located in: ".&$get_nexus_component_location($sensor_data{"id"}) ;
 			print "\n" ;
 		}
 		if (defined($nexus_entphysical{$id}{&entPhysicalDescr})) {
@@ -430,12 +598,12 @@ while((my $id,$fan) = each(%nexus_frufan)) {
         my %fan_data = %{$fan} ;
 
         if ($fan_data{&cefcFanTrayOperStatus} != NEXUS_FANTRAY_UP) {
-            push(@failed_items_description, get_nexus_component_location($fan_data{"id"})." is ". $nexus_fantray_status[$fan_data{&cefcFanTrayOperStatus}]) ;
+            push(@failed_items_description, &$get_nexus_component_location($fan_data{"id"})." is ". $nexus_fantray_status[$fan_data{&cefcFanTrayOperStatus}]) ;
             $number_of_failed_fan++;
         }
         if ($opt_l) {
             print "Fan ".$fan_data{"id"};
-            print " located in: ".get_nexus_component_location($fan_data{"id"}) ;
+            print " located in: ".&$get_nexus_component_location($fan_data{"id"}) ;
             print " status is ".$nexus_fantray_status[$fan_data{&cefcFanTrayOperStatus}] ;
             print "\n" ;
         }
@@ -457,12 +625,12 @@ while((my $id,$psu) = each(%nexus_frupsu)) {
         my %psu_data = %{$psu} ;
 
         if ($psu_data{&cefcFRUPowerOperStatus} != NEXUS_PSU_ON) {
-            push(@failed_items_description, get_nexus_component_location($psu_data{"id"})." is ". $nexus_psu_status[$psu_data{&cefcFRUPowerOperStatus}]) ;
+            push(@failed_items_description, &$get_nexus_component_location($psu_data{"id"})." is ". $nexus_psu_status[$psu_data{&cefcFRUPowerOperStatus}]) ;
             $number_of_failed_psu++;
         }
         if ($opt_l) {
             print "PSU ".$psu_data{"id"};
-            print " located in: ".get_nexus_component_location($psu_data{"id"}) ;
+            print " located in: ".&$get_nexus_component_location($psu_data{"id"}) ;
             print " status is ".$nexus_psu_status[$psu_data{&cefcFRUPowerOperStatus}] ;
             print "\n" ;
         }
@@ -493,169 +661,6 @@ foreach(@perfparse) {
 }
 exit($worst_final_return_code) ;
 
-sub print_usage () {
-    print "Usage:";
-    print "$PROGNAME\n";
-    print "   -H (--hostname)   Hostname to query - (required)\n";
-    print "   -C (--community)  SNMP read community (defaults to public,\n";
-    print "                     used with SNMP v1 and v2c\n";
-    print "   -v (--snmp_version)  1 for SNMP v1 (default)\n";
-    print "                        2 for SNMP v2c\n";
-    print "                        3 for SNMP v3\n";
-    print "   -k (--key)        snmp V3 key\n";
-    print "   -p (--password)   snmp V3 password\n";
-    print "   -u (--username)   snmp v3 username \n";
-    print "   --authprotocol    snmp v3 authprotocol md5|sha \n";
-    print "   --priv            snmp V3 priv password\n";
-    print "   --privprotocol    snmp v3 privprotocol des|aes \n";
-
-    print "   -V (--version)    Plugin version\n";
-    print "   -h (--help)       usage help\n\n" ;
-    print "   -l (--list)       list probes\n";
-    print "   -i (--sysdescr)   use sysdescr instead of sysname for label display\n";
-    print "\n" ;
-    print "   -d (--debug)      debug level (1 -> 15)" ;
-}
-
-sub print_help () {
-    print "##############################################\n";
-    print "#                ADEO Services               #\n";
-    print "##############################################\n";
-    print_usage();
-    print "\n";
-}
-
-sub verbose {
-    my $message = $_[0];
-    my $messagelevel = $_[1] ;
 
 
-    if ($messagelevel <= $loglevel) {
-        print "$message\n" ;
-	}
-}
 
-sub get_nexus_table {
-    my $baseoid = $_[0] ;    
-    my $is_indexed = $_[1] ;
-
-    verbose("get table for oid $baseoid", "10") ;
-    if ($snmp == 1) {
-    	$result = $session->get_table(-baseoid => $baseoid) ;
-    }else {
-    	$result = $session->get_table(-baseoid => $baseoid, -maxrepetitions => 20) ;
-    }
-    if (!defined($result)) {
-        print("UNKNOWN: SNMP get_table : ".$session->error()."\n");
-        exit $ERRORS{'UNKNOWN'};
-    }
-    my %nexus_values = %{$result} ;
-    my $id;
-    my $index;
-    my %nexus_return;
-    while(($key,$value) = each(%nexus_values)) {
-        $index = $id = $key ;
-		if ($is_indexed) {
-            $id =~ s/.*\.([0-9]+)\.[0-9]*$/$1/;
-            $key =~ s/(.*)\.[0-9]*\.[0-9]*/$1/ ;
-            $index =~ s/.*\.([0-9]+)$/$1/ ;
-    	    verbose("key=$key, id=$id, index=$index, value=$value", "15") ;
-            $nexus_return{$id}{$key}{$index} = $value;
-            $nexus_return{$id}{"id"}{$index} = $id ;
-		}else {
-            $id =~ s/.*\.([0-9]+)$/$1/;
-            $key =~ s/(.*)\.[0-9]*/$1/ ;
-    	    verbose("key=$key, id=$id, value=$value", "15") ;
-            $nexus_return{$id}{$key} = $value;
-            $nexus_return{$id}{"id"} = $id ;
-		}
-    }
-    return(%nexus_return) ;
-}
-
-sub get_nexus_entries {
-    my (@columns) = @_ ;    
-
-    verbose("get entries", "10") ;
-    if ($snmp == 1) {
-    	$result = $session->get_entries(-columns => @columns) ;
-    }else {
-    	$result = $session->get_entries(-columns => @columns, -maxrepetitions => 20) ;
-    }
-    if (!defined($result)) {
-        print("UNKNOWN: SNMP get_entries : ".$session->error()."\n");
-        exit $ERRORS{'UNKNOWN'};
-    }
-    my %nexus_values = %{$result} ;
-    my $id;
-    my %nexus_return;
-    while(($key,$value) = each(%nexus_values)) {
-        $id = $key ;
-        $id =~ s/.*\.([0-9]+)$/$1/;
-        $key =~ s/(.*)\.[0-9]*/$1/ ;
-    	verbose("key=$key, id=$id, value=$value", "15") ;
-        $nexus_return{$id}{$key} = $value;
-        $nexus_return{$id}{"id"} = $id ;
-    }
-    return(%nexus_return) ;
-}
-sub evaluate_sensor {
-    my $value     = $_[0];
-    my $compare   = $_[1] ;
-    my $threshold = $_[2] ;
-    my $severity  = $_[3];
-    my $rc = NEXUS_OK ;
-    verbose("compare $value to $threshold and will return $severity if operator $compare is met", "15") ;
-	switch ($compare) {
-		case 1 { 
-			verbose("lessthan compare", "10") ;
-			if ($value < $threshold) {
-                $rc = $severity ;    
-            }
-		}
-		case 2 { 
-			verbose("lessorequal compare", "10") ;
-			if ($value <= $threshold) {
-                $rc = $severity ;    
-            }
-		}
-		case 3 { 
-			verbose("greaterthan compare", "10") ;
-			if ($value > $threshold) {
-                $rc = $severity ;    
-            }
-		}
-		case 4 { 
-			verbose("greaterorequal compare", "10") ;
-			if ($value > $threshold) {
-                $rc = $severity ;    
-            }
-		}
-		case 5 { 
-			verbose("equalto compare", "10") ;
-			if ($value == $threshold) {
-                $rc = $severity ;    
-            }
-		}
-		case 6 { 
-			verbose("noequalto compare", "10") ;
-			if ($value != $threshold) {
-                $rc = $severity ;    
-            }
-		}
-    }
-	verbose("comparison result: $rc", "15") ;
-	return($rc) ;
-}
-
-sub get_nexus_component_location {
-    my $sensor_id = $_[0] ;
-    my $text_output = "" ;
-    $text_output =  $nexus_entphysical{$sensor_id}{&entPhysicalDescr} if (defined($nexus_entphysical{$sensor_id}{&entPhysicalDescr}));
-    my $parent = $nexus_entphysical{$sensor_id}{&entPhysicalContainedIn} ;
-    while (defined($parent) and $parent ne 0) {
-        $text_output .= "->".$nexus_entphysical{$parent}{&entPhysicalDescr} ;
-        $parent = $nexus_entphysical{$parent}{&entPhysicalContainedIn} ;
-    }
-    return($text_output) ;
-}
